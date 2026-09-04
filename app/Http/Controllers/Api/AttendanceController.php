@@ -11,6 +11,28 @@ use Illuminate\Support\Facades\Storage;
 class AttendanceController extends Controller
 {
     /**
+     * Menentukan tanggal bisnis absensi.
+     *
+     * Aturan:
+     * - 06:00 - 23:59 = tanggal hari ini
+     * - 00:00 - 05:59 = masih dianggap tanggal absensi kemarin
+     *
+     * Contoh:
+     * 03 September 2026 05:30 -> tanggal absensi 02 September 2026
+     * 03 September 2026 06:00 -> tanggal absensi 03 September 2026
+     */
+    private function getAttendanceDate(): Carbon
+    {
+        $now = now();
+
+        if ($now->hour < 6) {
+            return $now->copy()->subDay()->startOfDay();
+        }
+
+        return $now->copy()->startOfDay();
+    }
+
+    /**
      * Menampilkan semua data attendance.
      * Khusus ADMIN untuk mengelola absensi.
      */
@@ -34,13 +56,19 @@ class AttendanceController extends Controller
     }
 
     /**
-     * Menampilkan status attendance hari ini untuk user yang login.
-     * Bisa diakses oleh SIAPA SAJA (Admin / Barge Crew).
+     * Menampilkan status attendance
+     * berdasarkan siklus absensi saat ini.
+     *
+     * Aturan jam 06:00:
+     * - Jam 00:00 - 05:59 -> mengambil absensi kemarin
+     * - Jam 06:00+ -> mengambil absensi hari ini
      */
     public function today(Request $request)
     {
+        $attendanceDate = $this->getAttendanceDate();
+
         $attendance = Attendance::where('user_id', $request->user()->id)
-            ->whereDate('date', today())
+            ->whereDate('date', $attendanceDate)
             ->first();
 
         return response()->json([
@@ -51,7 +79,10 @@ class AttendanceController extends Controller
 
     /**
      * Clock In (Absen Masuk)
+     *
      * Bebas untuk SIAPA SAJA (Barge Crew & Admin).
+     *
+     * Setiap jam 06:00 dimulai siklus absensi baru.
      */
     public function clockIn(Request $request)
     {
@@ -63,41 +94,78 @@ class AttendanceController extends Controller
         ]);
 
         $user = $request->user();
-        $today = today();
 
-        // Cek apakah sudah clock in hari ini
+        // Tentukan tanggal absensi berdasarkan aturan jam 06:00
+        $attendanceDate = $this->getAttendanceDate();
+
+        /**
+         * Cek apakah user sudah clock in
+         * pada siklus absensi tersebut.
+         *
+         * Penting:
+         * Setelah jam 06:00, query ini hanya mencari
+         * tanggal hari ini sehingga absensi kemarin
+         * tidak menghalangi clock in baru.
+         */
         $attendance = Attendance::where('user_id', $user->id)
-            ->whereDate('date', $today)
+            ->whereDate('date', $attendanceDate)
             ->first();
 
         if ($attendance) {
             return response()->json([
                 'success' => false,
-                'message' => 'Anda sudah melakukan clock in hari ini.',
+                'message' => 'Anda sudah melakukan clock in pada siklus absensi ini.',
                 'data' => $attendance,
             ], 400);
         }
 
-        // KODE BARU (Pendekatan A)
         $now = now();
 
-        // 1. Tentukan Jam Masuk Kerja (08:00)
-        $workStart = Carbon::createFromTime(8, 0, 0);
+        /**
+         * Jam masuk kerja: 08:00
+         */
+        $workStart = Carbon::create(
+            $now->year,
+            $now->month,
+            $now->day,
+            8,
+            0,
+            0,
+            $now->timezone
+        );
 
-        // 2. Tentukan Batas Toleransi (08:00 + 15 Menit = 08:15)
+        /**
+         * Batas toleransi:
+         * 08:00 + 15 menit = 08:15
+         */
         $toleranceTime = $workStart->copy()->addMinutes(15);
 
-        // 3. Status Terlambat: Hanya bernilai true JIKA waktu absen melewati jam 08:15
+        /**
+         * Status terlambat:
+         * Hanya true jika clock in melewati 08:15.
+         */
         $isLate = $now->greaterThan($toleranceTime);
 
-        // 4. Durasi Terlambat: Dihitung selisih menitnya dari jam 08:15 (bukan dari 08:00)
-        $lateDuration = $isLate ? $toleranceTime->diffInMinutes($now) : 0;
+        /**
+         * Durasi terlambat dihitung dari 08:15,
+         * bukan dari 08:00.
+         */
+        $lateDuration = $isLate
+            ? $toleranceTime->diffInMinutes($now)
+            : 0;
 
-        $photoPath = $request->file('photo')->store('attendances', 'public');
+        /**
+         * Simpan foto clock in.
+         */
+        $photoPath = $request->file('photo')
+            ->store('attendances', 'public');
 
+        /**
+         * Buat attendance baru.
+         */
         $attendance = Attendance::create([
             'user_id' => $user->id,
-            'date' => $today,
+            'date' => $attendanceDate->toDateString(),
             'status' => 'present',
             'clock_in' => $now->format('H:i:s'),
             'latitude_in' => $request->latitude,
@@ -117,7 +185,11 @@ class AttendanceController extends Controller
 
     /**
      * Clock Out (Absen Pulang)
+     *
      * Bebas untuk SIAPA SAJA (Barge Crew & Admin).
+     *
+     * Clock out antara 00:00 - 05:59 masih akan
+     * menggunakan attendance tanggal sebelumnya.
      */
     public function clockOut(Request $request)
     {
@@ -130,32 +202,96 @@ class AttendanceController extends Controller
 
         $user = $request->user();
 
+        /**
+         * Ambil tanggal berdasarkan siklus 06:00.
+         *
+         * Contoh:
+         * Clock in 03 Sep 20:00
+         * Clock out 04 Sep 04:30
+         *
+         * getAttendanceDate() pada 04 Sep 04:30
+         * akan menghasilkan 03 Sep.
+         */
+        $attendanceDate = $this->getAttendanceDate();
+
         $attendance = Attendance::where('user_id', $user->id)
-            ->whereDate('date', today())
+            ->whereDate('date', $attendanceDate)
             ->first();
 
         if (!$attendance) {
             return response()->json([
                 'success' => false,
-                'message' => 'Anda belum melakukan clock in hari ini.',
+                'message' => 'Anda belum melakukan clock in pada siklus absensi ini.',
             ], 400);
         }
 
-        // Cek jika sudah clock out (2x absen selesai)
+        /**
+         * Cek jika sudah clock out.
+         */
         if ($attendance->clock_out) {
             return response()->json([
                 'success' => false,
-                'message' => 'Anda sudah menyelesaikan absensi hari ini (Clock In & Clock Out).',
+                'message' => 'Anda sudah menyelesaikan absensi pada siklus ini (Clock In & Clock Out).',
                 'data' => $attendance,
             ], 400);
         }
 
         $now = now();
-        $photoPath = $request->file('photo')->store('attendances', 'public');
 
-        $clockIn = Carbon::parse($attendance->date->format('Y-m-d') . ' ' . $attendance->clock_in);
-        $workDuration = $clockIn->diffInMinutes($now);
+        /**
+         * Simpan foto clock out.
+         */
+        $photoPath = $request->file('photo')
+            ->store('attendances', 'public');
 
+        /**
+         * Buat waktu clock in lengkap:
+         *
+         * tanggal attendance + jam clock in
+         *
+         * Contoh:
+         * date     = 2026-09-03
+         * clock_in = 20:00:00
+         *
+         * menjadi:
+         * 2026-09-03 20:00:00
+         */
+        $clockIn = Carbon::parse(
+            Carbon::parse($attendance->date)->format('Y-m-d')
+                . ' '
+                . $attendance->clock_in
+        );
+
+        /**
+         * Waktu clock out.
+         */
+        $clockOut = $now->copy();
+
+        /**
+         * Jika clock out terjadi setelah tengah malam
+         * dan waktu clock out terlihat lebih kecil daripada
+         * waktu clock in, berarti clock out berada di hari berikutnya.
+         *
+         * Contoh:
+         *
+         * Clock in  : 03 Sep 20:00
+         * Clock out : 04 Sep 04:30
+         *
+         * Karena 04:30 < 20:00,
+         * kita tambahkan 1 hari pada clock out.
+         */
+        if ($clockOut->lessThan($clockIn)) {
+            $clockOut->addDay();
+        }
+
+        /**
+         * Hitung total durasi kerja dalam menit.
+         */
+        $workDuration = $clockIn->diffInMinutes($clockOut);
+
+        /**
+         * Update attendance.
+         */
         $attendance->update([
             'clock_out' => $now->format('H:i:s'),
             'latitude_out' => $request->latitude,
@@ -167,13 +303,14 @@ class AttendanceController extends Controller
 
         return response()->json([
             'success' => true,
-            'message' => 'Clock out berhasil. Absensi hari ini telah lengkap.',
+            'message' => 'Clock out berhasil. Absensi pada siklus ini telah lengkap.',
             'data' => $attendance,
         ]);
     }
 
     /**
-     * Detail Absensi (Khusus Admin)
+     * Detail Absensi
+     * Khusus Admin.
      */
     public function show(Request $request, Attendance $attendance)
     {
@@ -193,7 +330,8 @@ class AttendanceController extends Controller
     }
 
     /**
-     * Update/Koreksi Absensi (Khusus Admin)
+     * Update/Koreksi Absensi
+     * Khusus Admin.
      */
     public function update(Request $request, Attendance $attendance)
     {
@@ -233,24 +371,35 @@ class AttendanceController extends Controller
             'is_late',
             'late_duration',
             'work_duration',
-            'notes'
+            'notes',
         ]);
 
+        /**
+         * Ganti foto clock in jika ada foto baru.
+         */
         if ($request->hasFile('photo_in')) {
             if ($attendance->photo_in) {
                 Storage::disk('public')->delete($attendance->photo_in);
             }
-            $data['photo_in'] = $request->file('photo_in')->store('attendances', 'public');
+
+            $data['photo_in'] = $request->file('photo_in')
+                ->store('attendances', 'public');
         }
 
+        /**
+         * Ganti foto clock out jika ada foto baru.
+         */
         if ($request->hasFile('photo_out')) {
             if ($attendance->photo_out) {
                 Storage::disk('public')->delete($attendance->photo_out);
             }
-            $data['photo_out'] = $request->file('photo_out')->store('attendances', 'public');
+
+            $data['photo_out'] = $request->file('photo_out')
+                ->store('attendances', 'public');
         }
 
         $attendance->update($data);
+
         $attendance->load('user');
 
         return response()->json([
@@ -261,7 +410,8 @@ class AttendanceController extends Controller
     }
 
     /**
-     * Hapus Absensi (Khusus Admin)
+     * Hapus Absensi
+     * Khusus Admin.
      */
     public function destroy(Request $request, Attendance $attendance)
     {
@@ -272,10 +422,16 @@ class AttendanceController extends Controller
             ], 403);
         }
 
+        /**
+         * Hapus foto clock in.
+         */
         if ($attendance->photo_in) {
             Storage::disk('public')->delete($attendance->photo_in);
         }
 
+        /**
+         * Hapus foto clock out.
+         */
         if ($attendance->photo_out) {
             Storage::disk('public')->delete($attendance->photo_out);
         }
