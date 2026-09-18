@@ -18,11 +18,13 @@ class Attendance extends Model
         'latitude_in',
         'longitude_in',
         'photo_in',
+        'address_in',
 
         'clock_out',
         'latitude_out',
         'longitude_out',
         'photo_out',
+        'address_out',
 
         'is_late',
         'late_duration',

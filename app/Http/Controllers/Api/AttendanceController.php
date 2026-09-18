@@ -7,6 +7,8 @@ use App\Models\Attendance;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class AttendanceController extends Controller
 {
@@ -95,18 +97,16 @@ class AttendanceController extends Controller
 
         $user = $request->user();
 
-        // Tentukan tanggal absensi berdasarkan aturan jam 06:00
+        // =========================================================
+        // TENTUKAN TANGGAL ABSENSI BERDASARKAN ATURAN JAM 06:00
+        // =========================================================
+
         $attendanceDate = $this->getAttendanceDate();
 
-        /**
-         * Cek apakah user sudah clock in
-         * pada siklus absensi tersebut.
-         *
-         * Penting:
-         * Setelah jam 06:00, query ini hanya mencari
-         * tanggal hari ini sehingga absensi kemarin
-         * tidak menghalangi clock in baru.
-         */
+        // =========================================================
+        // CEK APAKAH USER SUDAH CLOCK IN
+        // =========================================================
+
         $attendance = Attendance::where('user_id', $user->id)
             ->whereDate('date', $attendanceDate)
             ->first();
@@ -119,11 +119,16 @@ class AttendanceController extends Controller
             ], 400);
         }
 
+        // =========================================================
+        // WAKTU SEKARANG
+        // =========================================================
+
         $now = now();
 
-        /**
-         * Jam masuk kerja: 08:00
-         */
+        // =========================================================
+        // JAM MASUK KERJA: 08:00
+        // =========================================================
+
         $workStart = Carbon::create(
             $now->year,
             $now->month,
@@ -134,52 +139,152 @@ class AttendanceController extends Controller
             $now->timezone
         );
 
-        /**
-         * Batas toleransi:
-         * 08:00 + 15 menit = 08:15
-         */
+        // =========================================================
+        // BATAS TOLERANSI: 08:15
+        // =========================================================
+
         $toleranceTime = $workStart->copy()->addMinutes(15);
 
-        /**
-         * Status terlambat:
-         * Hanya true jika clock in melewati 08:15.
-         */
+        // =========================================================
+        // STATUS TERLAMBAT
+        // =========================================================
+
         $isLate = $now->greaterThan($toleranceTime);
 
-        /**
-         * Durasi terlambat dihitung dari 08:15,
-         * bukan dari 08:00.
-         */
+        // =========================================================
+        // DURASI TERLAMBAT
+        // Dihitung dari 08:15
+        // =========================================================
+
         $lateDuration = $isLate
             ? $toleranceTime->diffInMinutes($now)
             : 0;
 
-        /**
-         * Simpan foto clock in.
-         */
+        // =========================================================
+        // SIMPAN FOTO CLOCK IN
+        // =========================================================
+
         $photoPath = $request->file('photo')
             ->store('attendances', 'public');
 
-        /**
-         * Buat attendance baru.
-         */
+        // =========================================================
+        // REVERSE GEOCODE
+        // latitude + longitude
+        // menjadi address_in
+        // =========================================================
+
+        $addressIn = null;
+
+        try {
+
+            $latitude = $request->latitude;
+            $longitude = $request->longitude;
+
+            $response = Http::timeout(5)
+                ->withHeaders([
+                    'User-Agent' => 'MineraClockIn/1.0',
+                ])
+                ->get(
+                    'https://nominatim.openstreetmap.org/reverse',
+                    [
+                        'format' => 'jsonv2',
+                        'lat' => $latitude,
+                        'lon' => $longitude,
+                        'addressdetails' => 1,
+                        'zoom' => 18,
+                        'accept-language' => 'id',
+                    ]
+                );
+
+            if ($response->successful()) {
+
+                $addressIn =
+                    $response->json('display_name');
+            }
+        } catch (\Throwable $e) {
+
+            // Jangan menggagalkan clock in
+            // hanya karena reverse geocode gagal.
+
+            Log::warning(
+                'Reverse geocode clock in gagal',
+                [
+                    'latitude' => $request->latitude,
+                    'longitude' => $request->longitude,
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            $addressIn = null;
+        }
+
+        // =========================================================
+        // JIKA REVERSE GEOCODE GAGAL
+        // SIMPAN KOORDINAT SEBAGAI FALLBACK
+        // =========================================================
+
+        if (!$addressIn) {
+
+            $addressIn =
+                'Lat: ' .
+                $request->latitude .
+                ', Long: ' .
+                $request->longitude;
+        }
+
+        // =========================================================
+        // BUAT ATTENDANCE BARU
+        // =========================================================
+
         $attendance = Attendance::create([
+
             'user_id' => $user->id,
-            'date' => $attendanceDate->toDateString(),
+
+            'date' =>
+            $attendanceDate->toDateString(),
+
             'status' => 'present',
-            'clock_in' => $now->format('H:i:s'),
-            'latitude_in' => $request->latitude,
-            'longitude_in' => $request->longitude,
-            'photo_in' => $photoPath,
-            'is_late' => $isLate,
-            'late_duration' => $lateDuration,
-            'notes' => $request->notes,
+
+            // CLOCK IN
+            'clock_in' =>
+            $now->format('H:i:s'),
+
+            'latitude_in' =>
+            $request->latitude,
+
+            'longitude_in' =>
+            $request->longitude,
+
+            'photo_in' =>
+            $photoPath,
+
+            // ALAMAT HASIL REVERSE GEOCODE
+            'address_in' =>
+            $addressIn,
+
+            // ANALISIS
+            'is_late' =>
+            $isLate,
+
+            'late_duration' =>
+            $lateDuration,
+
+            'notes' =>
+            $request->notes,
         ]);
+
+        // =========================================================
+        // RESPONSE
+        // =========================================================
 
         return response()->json([
             'success' => true,
-            'message' => 'Clock in berhasil.',
-            'data' => $attendance,
+
+            'message' =>
+            'Clock in berhasil.',
+
+            'data' =>
+            $attendance,
         ], 201);
     }
 
@@ -203,14 +308,9 @@ class AttendanceController extends Controller
         $user = $request->user();
 
         /**
-         * Ambil tanggal berdasarkan siklus 06:00.
-         *
-         * Contoh:
-         * Clock in 03 Sep 20:00
-         * Clock out 04 Sep 04:30
-         *
-         * getAttendanceDate() pada 04 Sep 04:30
-         * akan menghasilkan 03 Sep.
+         * =========================================================
+         * AMBIL TANGGAL ABSENSI BERDASARKAN SIKLUS 06:00
+         * =========================================================
          */
         $attendanceDate = $this->getAttendanceDate();
 
@@ -226,7 +326,9 @@ class AttendanceController extends Controller
         }
 
         /**
-         * Cek jika sudah clock out.
+         * =========================================================
+         * CEK SUDAH CLOCK OUT
+         * =========================================================
          */
         if ($attendance->clock_out) {
             return response()->json([
@@ -239,22 +341,40 @@ class AttendanceController extends Controller
         $now = now();
 
         /**
-         * Simpan foto clock out.
+         * =========================================================
+         * REVERSE GEOCODE CLOCK OUT
+         * =========================================================
+         *
+         * Latitude + longitude Clock Out
+         * diubah menjadi alamat.
+         */
+        $addressOut = $this->reverseGeocode(
+            $request->latitude,
+            $request->longitude
+        );
+
+        /**
+         * Jika reverse geocode gagal,
+         * tetap simpan koordinat sebagai fallback.
+         */
+        if (!$addressOut) {
+            $addressOut =
+                'Lat: ' . $request->latitude .
+                ', Long: ' . $request->longitude;
+        }
+
+        /**
+         * =========================================================
+         * SIMPAN FOTO CLOCK OUT
+         * =========================================================
          */
         $photoPath = $request->file('photo')
             ->store('attendances', 'public');
 
         /**
-         * Buat waktu clock in lengkap:
-         *
-         * tanggal attendance + jam clock in
-         *
-         * Contoh:
-         * date     = 2026-09-03
-         * clock_in = 20:00:00
-         *
-         * menjadi:
-         * 2026-09-03 20:00:00
+         * =========================================================
+         * BUAT WAKTU CLOCK IN LENGKAP
+         * =========================================================
          */
         $clockIn = Carbon::parse(
             Carbon::parse($attendance->date)->format('Y-m-d')
@@ -263,43 +383,52 @@ class AttendanceController extends Controller
         );
 
         /**
-         * Waktu clock out.
+         * =========================================================
+         * WAKTU CLOCK OUT
+         * =========================================================
          */
         $clockOut = $now->copy();
 
         /**
-         * Jika clock out terjadi setelah tengah malam
-         * dan waktu clock out terlihat lebih kecil daripada
-         * waktu clock in, berarti clock out berada di hari berikutnya.
-         *
-         * Contoh:
-         *
-         * Clock in  : 03 Sep 20:00
-         * Clock out : 04 Sep 04:30
-         *
-         * Karena 04:30 < 20:00,
-         * kita tambahkan 1 hari pada clock out.
+         * Jika clock out setelah tengah malam,
+         * tambahkan 1 hari.
          */
         if ($clockOut->lessThan($clockIn)) {
             $clockOut->addDay();
         }
 
         /**
-         * Hitung total durasi kerja dalam menit.
+         * =========================================================
+         * HITUNG DURASI KERJA
+         * =========================================================
          */
         $workDuration = $clockIn->diffInMinutes($clockOut);
 
         /**
-         * Update attendance.
+         * =========================================================
+         * UPDATE ATTENDANCE
+         * =========================================================
          */
         $attendance->update([
             'clock_out' => $now->format('H:i:s'),
+
             'latitude_out' => $request->latitude,
+
             'longitude_out' => $request->longitude,
+
+            'address_out' => $addressOut,
+
             'photo_out' => $photoPath,
+
             'work_duration' => $workDuration,
+
             'notes' => $request->notes ?? $attendance->notes,
         ]);
+
+        /**
+         * Ambil ulang data terbaru dari database.
+         */
+        $attendance->refresh();
 
         return response()->json([
             'success' => true,
@@ -307,6 +436,49 @@ class AttendanceController extends Controller
             'data' => $attendance,
         ]);
     }
+
+    private function reverseGeocode($latitude, $longitude)
+    {
+        try {
+
+            $response = Http::withHeaders([
+                'User-Agent' => 'MineraClockIn/1.0',
+                'Accept' => 'application/json',
+            ])
+                ->timeout(10)
+                ->get(
+                    'https://nominatim.openstreetmap.org/reverse',
+                    [
+                        'format' => 'jsonv2',
+                        'lat' => $latitude,
+                        'lon' => $longitude,
+                        'addressdetails' => 1,
+                        'zoom' => 18,
+                        'accept-language' => 'id',
+                    ]
+                );
+
+            if (!$response->successful()) {
+                return null;
+            }
+
+            $data = $response->json();
+
+            return $data['display_name'] ?? null;
+        } catch (\Throwable $e) {
+
+            Log::error('Reverse geocode clock out gagal', [
+                'latitude' => $latitude,
+                'longitude' => $longitude,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+
+
 
     /**
      * Detail Absensi
